@@ -53,6 +53,7 @@ class _ReparameterizationMessenger(Messenger):
         "conv2d",
         "conv3d",
         "lstm",
+        "gru",
     ]
 
     def __init__(self, reparameterizable_functions=None):
@@ -81,7 +82,7 @@ class _ReparameterizationMessenger(Messenger):
         # if the distribution objects from the model/guide are kept around.
         self.deps = WeakValueDictionary()
         self.original_fns = [
-            eval("_VF." + name) if name in ("lstm") else getattr(F, name)
+            eval("_VF." + name) if name in ("lstm", "gru") else getattr(F, name)
             for name in self.reparameterizable_functions
         ]
         self._make_reparameterizable_functions_effectful()
@@ -96,14 +97,14 @@ class _ReparameterizationMessenger(Messenger):
     def _make_reparameterizable_functions_effectful(self):
         for name, fn in zip(self.reparameterizable_functions, self.original_fns):
             effectful_fn = update_wrapper(effectful(fn, type="reparameterizable"), fn)
-            if name in ("lstm"):
+            if name in ("lstm", "gru"):
                 setattr(_VF, name, effectful_fn)
             else:
                 setattr(F, name, effectful_fn)
 
     def _reset_reparameterizable_functions(self):
         for name, fn in zip(self.reparameterizable_functions, self.original_fns):
-            if name in ("lstm"):
+            if name in ("lstm", "gru"):
                 setattr(_VF, name, fn)
             else:
                 setattr(F, name, fn)
@@ -125,7 +126,7 @@ class _ReparameterizationMessenger(Messenger):
         args = list(msg["args"])
         kwargs = msg["kwargs"]
         x = kwargs.pop("input", None) or args.pop(0)
-        if msg["fn"].__name__ not in ("lstm"):
+        if msg["fn"].__name__ not in ("lstm", "gru"):
             # if w is in args, so must have been x, therefore w will now be the first argument in args if not in kwargs
             w = kwargs.pop("weight", None) or args.pop(0)
             # bias might be None, so check explicitly if it's in kwargs -- if it is positional, x and w
@@ -145,7 +146,11 @@ class _ReparameterizationMessenger(Messenger):
                     msg["done"] = True
         else:
             # for lstm/gru 2nd parameter can be either hx or batch_sizes
-            batch_sizes = args.pop(0) if torch.is_tensor(args[0]) else None
+            batch_sizes = (
+                args.pop(0) if torch.is_tensor(args[0]) and args[0].dim == 1 else None
+            )
+            if batch_sizes is not None:
+                raise ValueError("Packed sequences are not supported")
             hx = args.pop(0)
             # weights and bias are next in args
             w_b = args.pop(0)
@@ -235,37 +240,58 @@ class FlipoutMessenger(_ReparameterizationMessenger):
         """Implementation based on:
         https://github.com/IntelLabs/bayesian-torch/blob/main/bayesian_torch/layers/flipout_layers/rnn_flipout.py
         """
+        h_t, c_t = (
+            (hx[0].squeeze(), hx[1].squeeze()) if len(hx) == 2 else (hx.squeeze(), None)
+        )
+        hidden_size = h_t.shape[-1]
         w_ih, w_hh = w
         b_ih, b_hh = b
-        (h_t, c_t) = (hx[0].squeeze(), hx[1].squeeze())
-        HS = h_t.shape[-1]
         output, c_ts = [], []
         seq_size = x.shape[1]
         for t in range(seq_size):
-            ih = F.linear(x[:, t, :], w_ih, None)
-            hh = F.linear(h_t, w_hh, None)
+            ih = F.linear(x[:, t, :], w_ih, b_ih)
+            hh = F.linear(h_t, w_hh, b_hh)
             gates = ih + hh
-            i_t, f_t, g_t, o_t = (
-                torch.sigmoid(gates[:, :HS]),  # input
-                torch.sigmoid(gates[:, HS : HS * 2]),  # forget
-                torch.tanh(gates[:, HS * 2 : HS * 3]),
-                torch.sigmoid(gates[:, HS * 3 :]),  # output
-            )
-            c_t = f_t * c_t + i_t * g_t
-            h_t = o_t * torch.tanh(c_t)
-            c_t = f_t * c_t + i_t * g_t
-            h_t = o_t * torch.tanh(c_t)
+            if msg["fn"].__name__ == "lstm":
+                i_t, f_t, g_t, o_t = (
+                    torch.sigmoid(gates[:, :hidden_size]),
+                    torch.sigmoid(gates[:, hidden_size : hidden_size * 2]),
+                    torch.tanh(gates[:, hidden_size * 2 : hidden_size * 3]),
+                    torch.sigmoid(gates[:, hidden_size * 3 :]),
+                )
+                c_t = f_t * c_t + i_t * g_t
+                h_t = o_t * torch.tanh(c_t)
+                c_t = f_t * c_t + i_t * g_t
+                h_t = o_t * torch.tanh(c_t)
+                c_ts.append(c_t.unsqueeze(0))
+            elif msg["fn"].__name__ == "gru":
+                r_t, z_t = (
+                    torch.sigmoid(gates[:, :hidden_size]),
+                    torch.sigmoid(gates[:, hidden_size : hidden_size * 2]),
+                )
+                n_t = torch.tanh(
+                    gates[:, hidden_size * 2 : hidden_size * 3]
+                    + F.linear(
+                        h_t * r_t,
+                        w_hh[hidden_size * 2 : hidden_size * 3],
+                        b_hh[hidden_size * 2 : hidden_size * 3],
+                    )
+                )
+                h_t = (1 - z_t) * n_t + z_t * h_t
 
             output.append(h_t.unsqueeze(0))
-            c_ts.append(c_t.unsqueeze(0))
 
         output = torch.cat(output, dim=0)
-        c_ts = torch.cat(c_ts, dim=0)
-        batch_first = hx[0].shape[1] == x.shape[0]
+        batch_first = h_t.shape[0] == x.shape[0]
         if batch_first:
-            # reshape from shape (sequence, batch, feature) to (batch, sequence, feature)
+            # reshape to (batch, sequence, feature)
             output = output.transpose(0, 1).contiguous()
-            c_ts = c_ts.transpose(0, 1).contiguous()
         h_n = output[:, -1, :].unsqueeze(0)
-        c_n = c_ts[:, -1, :].unsqueeze(0)
-        return output, h_n, c_n
+        if msg["fn"].__name__ == "lstm":
+            c_ts = torch.cat(c_ts, dim=0)
+            if batch_first:
+                # reshape to (batch, sequence, feature)
+                c_ts = c_ts.transpose(0, 1).contiguous()
+            c_n = c_ts[:, -1, :].unsqueeze(0)
+            return output, h_n, c_n
+        return output, h_n
