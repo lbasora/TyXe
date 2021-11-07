@@ -3,14 +3,16 @@ from weakref import WeakValueDictionary, WeakKeyDictionary
 
 import torch
 import torch.nn.functional as F
-import torch._VF as _VF
 
 import pyro.distributions as dist
 from pyro.poutine.messenger import Messenger
 from pyro.poutine.runtime import effectful
 
 
-__all__ = ["LocalReparameterizationMessenger", "FlipoutMessenger"]
+__all__ = [
+    "LocalReparameterizationMessenger",
+    "FlipoutMessenger"
+]
 
 
 def _get_base_dist(distribution):
@@ -47,14 +49,7 @@ class _ReparameterizationMessenger(Messenger):
     modules in pytorch."""
 
     # TODO check if transposed convolutions could be added as well, might be useful for Bayesian conv VAEs
-    REPARAMETERIZABLE_FUNCTIONS = [
-        "linear",
-        "conv1d",
-        "conv2d",
-        "conv3d",
-        "lstm",
-        "gru",
-    ]
+    REPARAMETERIZABLE_FUNCTIONS = ["linear", "conv1d", "conv2d", "conv3d"]
 
     def __init__(self, reparameterizable_functions=None):
         super().__init__()
@@ -65,10 +60,8 @@ class _ReparameterizationMessenger(Messenger):
         elif isinstance(reparameterizable_functions, (list, tuple)):
             reparameterizable_functions = list(reparameterizable_functions)
         else:
-            raise ValueError(
-                f"Unrecognized type for argument 'reparameterizable_functions. Must be str, list or "
-                f"None, but go '{reparameterizable_functions.__class__.__name__}'."
-            )
+            raise ValueError(f"Unrecognized type for argument 'reparameterizable_functions. Must be str, list or "
+                             f"None, but go '{reparameterizable_functions.__class__.__name__}'.")
         self.reparameterizable_functions = reparameterizable_functions
 
     def __enter__(self):
@@ -81,10 +74,7 @@ class _ReparameterizationMessenger(Messenger):
         # the samples from the distributions. However this still means that the self.deps dictionary will keep growing
         # if the distribution objects from the model/guide are kept around.
         self.deps = WeakValueDictionary()
-        self.original_fns = [
-            eval("_VF." + name) if name in ("lstm", "gru") else getattr(F, name)
-            for name in self.reparameterizable_functions
-        ]
+        self.original_fns = [getattr(F, name) for name in self.reparameterizable_functions]
         self._make_reparameterizable_functions_effectful()
         return super().__enter__()
 
@@ -97,17 +87,11 @@ class _ReparameterizationMessenger(Messenger):
     def _make_reparameterizable_functions_effectful(self):
         for name, fn in zip(self.reparameterizable_functions, self.original_fns):
             effectful_fn = update_wrapper(effectful(fn, type="reparameterizable"), fn)
-            if name in ("lstm", "gru"):
-                setattr(_VF, name, effectful_fn)
-            else:
-                setattr(F, name, effectful_fn)
+            setattr(F, name, effectful_fn)
 
     def _reset_reparameterizable_functions(self):
         for name, fn in zip(self.reparameterizable_functions, self.original_fns):
-            if name in ("lstm", "gru"):
-                setattr(_VF, name, fn)
-            else:
-                setattr(F, name, fn)
+            setattr(F, name, fn)
 
     def _pyro_post_sample(self, msg):
         if id(msg["value"]) not in self.deps:
@@ -118,57 +102,25 @@ class _ReparameterizationMessenger(Messenger):
             return
 
         if msg["done"]:
-            raise ValueError(
-                f"Trying to reparameterize a {msg['fn'].__name__} site that has already been processed. "
-                f"Did you use multiple reparameterization messengers for the same function?"
-            )
+            raise ValueError(f"Trying to reparameterize a {msg['fn'].__name__} site that has already been processed. "
+                             f"Did you use multiple reparameterization messengers for the same function?")
 
         args = list(msg["args"])
         kwargs = msg["kwargs"]
         x = kwargs.pop("input", None) or args.pop(0)
-        if msg["fn"].__name__ not in ("lstm", "gru"):
-            # if w is in args, so must have been x, therefore w will now be the first argument in args if not in kwargs
-            w = kwargs.pop("weight", None) or args.pop(0)
-            # bias might be None, so check explicitly if it's in kwargs -- if it is positional, x and w
-            # must have been positional arguments as well
-            b = kwargs.pop("bias") if "bias" in kwargs else args.pop(0)
-            if id(w) in self.deps:
-                w_fn = self.deps[id(w)]
-                b_fn = self.deps[id(b)] if b is not None else None
-                if (
-                    torch.is_tensor(x)
-                    and _is_reparameterizable(w_fn)
-                    and _is_reparameterizable(b_fn)
-                ):
-                    msg["value"] = self._reparameterize(
-                        msg, x, w_fn, w, b_fn, b, *args, **kwargs
-                    )
-                    msg["done"] = True
-        else:
-            # for lstm/gru 2nd parameter can be either hx or batch_sizes
-            batch_sizes = (
-                args.pop(0) if torch.is_tensor(args[0]) and args[0].dim == 1 else None
-            )
-            if batch_sizes is not None:
-                raise ValueError("Packed sequences are not supported")
-            hx = args.pop(0)
-            # weights and bias are next in args
-            w_b = args.pop(0)
-            msg["value"] = self._reparameterize_rnn(
-                msg,
-                x,
-                hx,
-                w_b[:2],
-                w_b[2:] if len(w_b) == 4 else (None, None),
-                *args,
-                **kwargs,
-            )
-            msg["done"] = True
+        # if w is in args, so must have been x, therefore w will now be the first argument in args if not in kwargs
+        w = kwargs.pop("weight", None) or args.pop(0)
+        # bias might be None, so check explicitly if it's in kwargs -- if it is positional, x and w
+        # must have been positional arguments as well
+        b = kwargs.pop("bias") if "bias" in kwargs else args.pop(0)
+        if id(w) in self.deps:
+            w_fn = self.deps[id(w)]
+            b_fn = self.deps[id(b)] if b is not None else None
+            if torch.is_tensor(x) and _is_reparameterizable(w_fn) and _is_reparameterizable(b_fn):
+                msg["value"] = self._reparameterize(msg, x, w_fn, w, b_fn, b, *args, **kwargs)
+                msg["done"] = True
 
     def _reparameterize(self, msg, x, w_loc, w_var, b_loc, b_var, *args, **kwargs):
-        raise NotImplementedError
-
-    def _reparameterize_rnn(self, msg, x, hx, w, b, *args, **kwargs):
         raise NotImplementedError
 
 
@@ -207,91 +159,21 @@ class FlipoutMessenger(_ReparameterizationMessenger):
         loc = fn(x, w_loc, None, *args, **kwargs)
 
         # x might be one dimensional for a 1-d input with a single datapoint to F.linear, F.conv always has a batch dim
-        batch_shape = (
-            x.shape[: -self.FUNCTION_RANKS[fn.__name__]] if x.ndim > 1 else tuple()
-        )
+        batch_shape = x.shape[:-self.FUNCTION_RANKS[fn.__name__]] if x.ndim > 1 else tuple()
         # w might be 1-d for F.linear for a 0-d output
         output_shape = (w_loc.shape[0],) if w_loc.ndim > 1 else tuple()
         input_shape = (w_loc.shape[1],) if w_loc.ndim > 1 else (w_loc.shape[0],)
 
         if not hasattr(w, "sign_input"):
-            w.sign_input = _pad_right_like(
-                _rand_signs(batch_shape + input_shape, device=loc.device), x
-            )
-            w.sign_output = _pad_right_like(
-                _rand_signs(batch_shape + output_shape, device=loc.device), x
-            )
+            w.sign_input = _pad_right_like(_rand_signs(batch_shape + input_shape, device=loc.device), x)
+            w.sign_output = _pad_right_like(_rand_signs(batch_shape + output_shape, device=loc.device), x)
 
         w_perturbation = w - w_loc
-        perturbation = (
-            fn(x * w.sign_input, w_perturbation, None, *args, **kwargs) * w.sign_output
-        )
+        perturbation = fn(x * w.sign_input, w_perturbation, None, *args, **kwargs) * w.sign_output
 
         output = loc + perturbation
         if b is not None:
             b_loc, b_var = _get_loc_var(b_fn)
-            bias = _pad_right_like(
-                dist.Normal(b_loc, b_var.sqrt()).rsample(batch_shape), output
-            )
+            bias = _pad_right_like(dist.Normal(b_loc, b_var.sqrt()).rsample(batch_shape), output)
             output += bias
         return output
-
-    def _reparameterize_rnn(self, msg, x, hx, w, b, *args, **kwargs):
-        """Implementation based on:
-        https://github.com/IntelLabs/bayesian-torch/blob/main/bayesian_torch/layers/flipout_layers/rnn_flipout.py
-        """
-        h_t, c_t = (
-            (hx[0].squeeze(), hx[1].squeeze()) if len(hx) == 2 else (hx.squeeze(), None)
-        )
-        hidden_size = h_t.shape[-1]
-        w_ih, w_hh = w
-        b_ih, b_hh = b
-        output, c_ts = [], []
-        seq_size = x.shape[1]
-        for t in range(seq_size):
-            ih = F.linear(x[:, t, :], w_ih, b_ih)
-            hh = F.linear(h_t, w_hh, b_hh)
-            gates = ih + hh
-            if msg["fn"].__name__ == "lstm":
-                i_t, f_t, g_t, o_t = (
-                    torch.sigmoid(gates[:, :hidden_size]),
-                    torch.sigmoid(gates[:, hidden_size : hidden_size * 2]),
-                    torch.tanh(gates[:, hidden_size * 2 : hidden_size * 3]),
-                    torch.sigmoid(gates[:, hidden_size * 3 :]),
-                )
-                c_t = f_t * c_t + i_t * g_t
-                h_t = o_t * torch.tanh(c_t)
-                c_t = f_t * c_t + i_t * g_t
-                h_t = o_t * torch.tanh(c_t)
-                c_ts.append(c_t.unsqueeze(0))
-            elif msg["fn"].__name__ == "gru":
-                r_t, z_t = (
-                    torch.sigmoid(gates[:, :hidden_size]),
-                    torch.sigmoid(gates[:, hidden_size : hidden_size * 2]),
-                )
-                n_t = torch.tanh(
-                    gates[:, hidden_size * 2 : hidden_size * 3]
-                    + F.linear(
-                        h_t * r_t,
-                        w_hh[hidden_size * 2 : hidden_size * 3],
-                        b_hh[hidden_size * 2 : hidden_size * 3],
-                    )
-                )
-                h_t = (1 - z_t) * n_t + z_t * h_t
-
-            output.append(h_t.unsqueeze(0))
-
-        output = torch.cat(output, dim=0)
-        batch_first = h_t.shape[0] == x.shape[0]
-        if batch_first:
-            # reshape to (batch, sequence, feature)
-            output = output.transpose(0, 1).contiguous()
-        h_n = output[:, -1, :].unsqueeze(0)
-        if msg["fn"].__name__ == "lstm":
-            c_ts = torch.cat(c_ts, dim=0)
-            if batch_first:
-                # reshape to (batch, sequence, feature)
-                c_ts = c_ts.transpose(0, 1).contiguous()
-            c_n = c_ts[:, -1, :].unsqueeze(0)
-            return output, h_n, c_n
-        return output, h_n
