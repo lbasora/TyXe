@@ -3,7 +3,22 @@ import torch.nn.functional as F
 from torch import nn
 
 
-class RNNFlipout(nn.LSTM):
+class LSTMFlipout(nn.LSTM):
+    def forward(self, input, hx=None):
+        return _forward(
+            self.mode,
+            input,
+            hx,
+            self._flat_weights,
+            self.hidden_size,
+            self.num_layers,
+            self.bidirectional,
+            self.batch_first,
+            self.dropout,
+        )
+
+
+class GRUFlipout(nn.GRU):
     def forward(self, input, hx=None):
         return _forward(
             self.mode,
@@ -19,8 +34,10 @@ class RNNFlipout(nn.LSTM):
 
 
 def to_rnn_flipout(rnn):
-    if isinstance(rnn, nn.LSTM) or isinstance(rnn, nn.GRU):
-        rnn.__class__ = RNNFlipout
+    if isinstance(rnn, nn.LSTM):
+        rnn.__class__ = LSTMFlipout
+    elif isinstance(rnn, nn.GRU):
+        rnn.__class__ = GRUFlipout
     else:
         raise ValueError("Flipout only supported for LSTM/GRU RNN mode")
 
