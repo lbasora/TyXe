@@ -3,22 +3,7 @@ import torch.nn.functional as F
 from torch import nn
 
 
-class LSTMFlipout(nn.LSTM):
-    def forward(self, input, hx=None):
-        return _forward(
-            self.mode,
-            input,
-            hx,
-            self._flat_weights,
-            self.hidden_size,
-            self.num_layers,
-            self.bidirectional,
-            self.batch_first,
-            self.dropout,
-        )
-
-
-class GRUFlipout(nn.GRU):
+class RNNFlipout(nn.LSTM):
     def forward(self, input, hx=None):
         return _forward(
             self.mode,
@@ -34,10 +19,10 @@ class GRUFlipout(nn.GRU):
 
 
 def to_rnn_flipout(rnn):
-    if isinstance(rnn, nn.LSTM):
-        rnn.__class__ = LSTMFlipout
-    elif isinstance(rnn, nn.GRU):
-        rnn.__class__ = LSTMFlipout
+    if isinstance(rnn, nn.LSTM) or isinstance(rnn, nn.GRU):
+        rnn.__class__ = RNNFlipout
+    else:
+        raise ValueError("Flipout only supported for LSTM/GRU RNN mode")
 
 
 def _forward(
@@ -46,9 +31,6 @@ def _forward(
     """Implementation based on:
     https://github.com/IntelLabs/bayesian-torch/blob/main/bayesian_torch/layers/flipout_layers/rnn_flipout.py
     """
-
-    if mode not in ("LSTM", "GRU"):
-        raise ValueError("Flipout only supported for LSTM/GRU RNN mode")
 
     if num_layers > 1:
         raise ValueError("Flipout for multilayer RNN not supported yet")
